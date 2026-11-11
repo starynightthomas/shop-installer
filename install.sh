@@ -81,7 +81,18 @@ EOF
 # ---------- sunucu ayarları: Cloudflare ve GitHub anahtarları ----------
 # Sunucu kurulumunda bir kez sorulur, sadece root'un okuyabileceği dosyada saklanır. Her "yenisite" bunları
 # kullanarak DNS kaydını açar ve gizli depoya o sitenin salt okunur anahtarını ekler.
-DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$'
+DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,}|xn--[a-z0-9-]{2,59})$'
+# Yazılan/yapıştırılan alan adını temizler: boşluk ve görünmez karakterler, http(s)://, www., sondaki / ve nokta;
+# küçük harfe çevirir; Türkçe harfli alan adlarını (mağaza.com) internet biçimine (xn--…) çevirir.
+clean_domain() {
+  local d
+  d=$(printf %s "$1" | tr -d '[:space:]' | LC_ALL=C sed 's/\xE2\x80[\x8B-\x8F]//g; s/\xEF\xBB\xBF//g')
+  d=${d#http://}; d=${d#https://}; d=${d%%/*}; d=${d%.}; d=${d#www.}
+  if printf %s "$d" | LC_ALL=C grep -q '[^ -~]'; then
+    d=$(python3 -c 'import sys; print(sys.argv[1].lower().encode("idna").decode())' "$d" 2> /dev/null || printf %s "$d")
+  fi
+  printf %s "${d,,}"
+}
 CONF_DIR=/etc/shop-installer
 CRED=$CONF_DIR/credentials
 SITES_DIR=$CONF_DIR/sites
@@ -505,12 +516,11 @@ if [ -n "$CHANGE" ]; then
 
   bold "Alan adı değişikliği: $NAME"
   echo "Şu anki adres: https://$OLD_DOMAIN"
-  DOMAIN=${ARG_DOMAIN,,}
+  DOMAIN=$(clean_domain "$ARG_DOMAIN")
   while ! [[ $DOMAIN =~ $DOMAIN_RE ]] || [ "$DOMAIN" = "$OLD_DOMAIN" ]; do
-    [ -n "$DOMAIN" ] && warn "Geçersiz ya da aynı alan adı: $DOMAIN"
+    [ -n "$DOMAIN" ] && warn "Geçersiz ya da aynı alan adı: [$DOMAIN]"
     [ "$YES" = 1 ] && die "Geçerli ve farklı bir --domain ver."
-    DOMAIN=$(ask "Yeni alan adı (ör. yenimagaza.com): ")
-    DOMAIN=${DOMAIN#http://}; DOMAIN=${DOMAIN#https://}; DOMAIN=${DOMAIN%%/*}; DOMAIN=${DOMAIN#www.}; DOMAIN=${DOMAIN,,}
+    DOMAIN=$(clean_domain "$(ask "Yeni alan adı (ör. yenimagaza.com): ")")
   done
   PUBLIC_IP=$(curl -fsS --max-time 5 https://api.ipify.org 2> /dev/null || true)
   dns_plan
@@ -601,12 +611,11 @@ bold "Yeni site"
 echo "Sunucundaki diğer sitelere dokunulmaz. Ne yapılacağı gösterilip başlamadan önce onay istenir."
 
 # ---------- 2. sorular ----------
-DOMAIN=${DOMAIN,,}
+DOMAIN=$(clean_domain "$DOMAIN")
 while ! [[ $DOMAIN =~ $DOMAIN_RE ]]; do
-  [ -n "$DOMAIN" ] && warn "Geçersiz alan adı: $DOMAIN"
+  [ -n "$DOMAIN" ] && warn "Bu alan adı geçersiz: [$DOMAIN] — sadece harf, rakam, tire ve nokta olmalı (ör. magazam.click)"
   [ "$YES" = 1 ] && die "Geçerli bir --domain ver."
-  DOMAIN=$(ask "Alan adı (ör. magazam.com): ")
-  DOMAIN=${DOMAIN#http://}; DOMAIN=${DOMAIN#https://}; DOMAIN=${DOMAIN%%/*}; DOMAIN=${DOMAIN#www.}; DOMAIN=${DOMAIN,,}
+  DOMAIN=$(clean_domain "$(ask "Alan adı (ör. magazam.com): ")")
 done
 SUGGESTED=$(printf %s "${DOMAIN%%.*}" | tr -cd 'a-z0-9-' | cut -c1-20)
 [[ $SUGGESTED =~ ^[a-z] ]] || SUGGESTED="shop-$SUGGESTED"
