@@ -41,7 +41,7 @@ warn() { printf '\033[33m!\033[0m %s\n' "$*"; }
 die() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 step() { printf '\n\033[1;34m▸ %s\033[0m\n' "$*"; }
 # curl | bash ile çalışırken standart girdi script'in kendisidir: sorular terminalden okunur.
-ask() { local reply; read -r -p "$1" reply < /dev/tty; printf %s "$reply"; }
+ask() { local reply; read -r -p "$1" reply < /dev/tty || die "Giriş kapandı; kurulum durdu (hiçbir şey kaydedilmedi)."; printf %s "$reply"; }
 confirm() {
   [ "$YES" = 1 ] && return 0
   case "$(ask "$1 [e/H] ")" in e|E|evet|y|Y|yes) return 0 ;; *) return 1 ;; esac
@@ -80,7 +80,7 @@ CRED=$CONF_DIR/credentials
 SITES_DIR=$CONF_DIR/sites
 CF_API_TOKEN='' CF_ACCOUNT_ID='' GITHUB_TOKEN=''
 
-ask_secret() { local reply; read -r -s -p "$1" reply < /dev/tty; echo > /dev/tty; printf %s "$reply"; }
+ask_secret() { local reply; read -r -s -p "$1" reply < /dev/tty || die "Giriş kapandı; kurulum durdu (hiçbir şey kaydedilmedi)."; echo > /dev/tty; printf %s "$reply"; }
 load_creds() { if [ -f "$CRED" ]; then . "$CRED"; fi; }
 
 cf_api() { # METHOD PATH [JSON]
