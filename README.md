@@ -8,7 +8,9 @@ Ubuntu/Debian bir sunucuyu, tek komutla yeni mağaza açılabilen bir sunucuya �
 curl -fsSL https://raw.githubusercontent.com/starynightthomas/shop-installer/main/install.sh | sudo bash
 ```
 
-İki anahtar sorar (yazdıkların ekranda görünmez, sadece sunucuda root'un okuyabileceği bir dosyada saklanır):
+Önce sunucuyu hazırlar (onay ister): tüm sistem paketlerini son sürüme yükseltir, gerekli araçları kurar, otomatik güvenlik güncellemelerini ve saat eşitlemeyi açar, RAM azsa swap oluşturur, güvenlik duvarını (SSH portu, 80 ve 443 açık) ve fail2ban'ı açar. SSH giriş ayarlarına dokunmaz. Gerekirse sonunda yeniden başlatmayı sorar.
+
+Sonra iki anahtar sorar (yazdıkların ekranda görünmez, sadece sunucuda root'un okuyabileceği bir dosyada saklanır):
 
 - **Cloudflare API anahtarı** — dash.cloudflare.com → API Tokens → Create Token → Custom token
   - Permissions: `Zone · Zone · Edit` ve `Zone · DNS · Edit`
