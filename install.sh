@@ -10,6 +10,7 @@
 # mevcut web sunucusuna (Nginx / Apache / Caddy) sadece bu alan adı için ayrı bir dosya ekler.
 #
 # Seçenekler (sormadan kurmak için): --domain magazam.com --name magazam --yes   |   --dry-run: sadece planı göster
+# Alan adını değiştirmek için: --alanadi <ad>  (yeni alan adı sorulur; Cloudflare'e eklenir, nameserver'lar söylenir)
 # Kaldırmak için: --uninstall <ad>   (önce /root'a son yedek alınır, adı yazarak onay istenir)
 set -euo pipefail
 
@@ -20,7 +21,7 @@ GITHUB_ED25519=SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU
 NODE_MAJOR=22
 ADMIN_PATH=/minad
 
-DOMAIN='' NAME='' YES=0 DRY=0 UNINSTALL='' SETUP=0 LIST=0
+DOMAIN='' NAME='' YES=0 DRY=0 UNINSTALL='' SETUP=0 LIST=0 CHANGE=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --domain) DOMAIN=${2:-}; shift 2 ;;
@@ -29,6 +30,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY=1; shift ;;
     --setup) SETUP=1; shift ;;
     --list) LIST=1; shift ;;
+    --alanadi|--change-domain) CHANGE=${2:-}; shift 2 ;;
     --uninstall) UNINSTALL=${2:-}; shift 2 ;;
     *) echo "Bilinmeyen seçenek: $1" >&2; exit 2 ;;
   esac
@@ -75,6 +77,7 @@ EOF
 # ---------- sunucu ayarları: Cloudflare ve GitHub anahtarları ----------
 # Sunucu kurulumunda bir kez sorulur, sadece root'un okuyabileceği dosyada saklanır. Her "yenisite" bunları
 # kullanarak DNS kaydını açar ve gizli depoya o sitenin salt okunur anahtarını ekler.
+DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$'
 CONF_DIR=/etc/shop-installer
 CRED=$CONF_DIR/credentials
 SITES_DIR=$CONF_DIR/sites
@@ -188,6 +191,136 @@ wait_dns() { # host ip
   return 1
 }
 
+
+# ---------- web sunucusu ayarı (yeni site ve alan adı değişikliği ortak) ----------
+# Kullanır: NAME DOMAIN PORT WWW WWW_HOST, isteğe bağlı REDIRECT_HOSTS (eski alan adları → yeni adrese yönlenir)
+caddy_site() {
+  cat <<EOF
+# Mağaza: $NAME (install.sh)
+$DOMAIN {
+	encode zstd gzip
+	request_body {
+		max_size 12MB
+	}
+	reverse_proxy 127.0.0.1:$PORT {
+		lb_try_duration 10s
+		lb_try_interval 250ms
+	}
+	log
+}
+EOF
+  if [ "$WWW" = 1 ]; then printf 'www.%s {\n\tredir https://%s{uri} permanent\n}\n' "$DOMAIN" "$DOMAIN"; fi
+  if [ -n "${REDIRECT_HOSTS:-}" ]; then
+    printf '# Eski alan adları → %s\n%s {\n\tredir https://%s{uri} permanent\n}\n' "$DOMAIN" "$(printf %s "$REDIRECT_HOSTS" | sed 's/ /, /g')" "$DOMAIN"
+  fi
+}
+caddy_valid() { caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile > /dev/null 2>&1; }
+certbot_for() { # $1 eklenti (nginx|apache)
+  local names=(-d "$DOMAIN")
+  if [ "$WWW" = 1 ]; then names+=(-d "www.$DOMAIN"); fi
+  certbot "--$1" -n --agree-tos --register-unsafely-without-email --redirect "${names[@]}" > /dev/null 2>&1 \
+    || warn "HTTPS sertifikası alınamadı (DNS henüz bu sunucuyu göstermiyor olabilir). Sonra: certbot --$1 -d $DOMAIN"
+}
+nginx_site_path() { if [ -d /etc/nginx/sites-available ]; then echo "/etc/nginx/sites-available/$NAME"; else echo "/etc/nginx/conf.d/$NAME.conf"; fi; }
+write_nginx_site() {
+  cat > "$(nginx_site_path)" <<EOF
+# Mağaza: $NAME (install.sh)
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN $WWW_HOST;
+    client_max_body_size 12m;
+    location / {
+        proxy_pass http://127.0.0.1:$PORT;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+}
+write_apache_site() {
+  cat > "/etc/apache2/sites-available/$NAME.conf" <<EOF
+# Mağaza: $NAME (install.sh)
+<VirtualHost *:80>
+    ServerName $DOMAIN
+$(if [ "$WWW" = 1 ]; then echo "    ServerAlias www.$DOMAIN"; fi)
+    ProxyPreserveHost On
+    RequestHeader set X-Forwarded-Proto expr=%{REQUEST_SCHEME}
+    ProxyPass / http://127.0.0.1:$PORT/
+    ProxyPassReverse / http://127.0.0.1:$PORT/
+</VirtualHost>
+EOF
+}
+
+# ---------- DNS planı ve uygulaması (yeni site ve alan adı değişikliği ortak) ----------
+# dns_plan: ZONE ZONE_ID ZONE_NAME NEW_ZONE WWW WWW_HOST ayarlar (hiçbir şey değiştirmez)
+dns_plan() {
+  ZONE='' ZONE_ID='' ZONE_NAME='' NEW_ZONE='' WWW=0 WWW_HOST=''
+  if [ -n "$CF_API_TOKEN" ]; then ZONE=$(cf_zone_for "$DOMAIN"); fi
+  if [ -n "$ZONE" ]; then ZONE_ID=${ZONE%% *}; ZONE_NAME=${ZONE#* }; fi
+  if [ -z "$ZONE" ] && [ -n "$CF_API_TOKEN" ] && [ -n "$CF_ACCOUNT_ID" ]; then NEW_ZONE=$(registrable "$DOMAIN"); fi
+  if { [ -n "$ZONE" ] || [ -n "$NEW_ZONE" ]; } && [ -z "$PUBLIC_IP" ]; then die "Sunucunun dış IP adresi bulunamadı (internet bağlantısını kontrol et)."; fi
+  if [ -n "$NEW_ZONE" ] && [ "$DOMAIN" = "$NEW_ZONE" ]; then WWW=1
+  elif [ -n "$ZONE" ] && [ "$DOMAIN" = "$ZONE_NAME" ]; then WWW=1
+  # Cloudflare'de değilse: www. de bu sunucuyu gösteriyorsa eklenir (yoksa sertifika boşuna denenmesin).
+  elif [ -n "$PUBLIC_IP" ] && [ "$(getent ahostsv4 "www.$DOMAIN" 2> /dev/null | awk 'NR==1{print $1}')" = "$PUBLIC_IP" ]; then WWW=1; fi
+  if [ "$WWW" = 1 ]; then WWW_HOST="www.$DOMAIN"; fi
+}
+dns_plan_text() {
+  if [ -n "$ZONE" ]; then
+    echo "  DNS           : Cloudflare ($ZONE_NAME) → $DOMAIN$([ "$WWW" = 1 ] && echo " ve www.$DOMAIN") → $PUBLIC_IP (otomatik)"
+  elif [ -n "$NEW_ZONE" ]; then
+    echo "  DNS           : $NEW_ZONE Cloudflare hesabına eklenecek, $DOMAIN$([ "$WWW" = 1 ] && echo " ve www.$DOMAIN") → $PUBLIC_IP"
+    echo "                  (sonunda alan adını aldığın yerde değiştireceğin nameserver'lar yazılacak)"
+  else
+    echo "  DNS           : $DOMAIN bu Cloudflare hesabında yok → kaydı elle yapman gerekecek"
+  fi
+}
+# dns_apply: gerekirse bölgeyi oluşturur (NAMESERVERS), A kayıtlarını açar (CF_RECORD_IDS)
+dns_apply() {
+  CF_RECORD_IDS='' NAMESERVERS=''
+  if [ -n "$NEW_ZONE" ]; then
+    step "Alan adı Cloudflare'e ekleniyor"
+    local created; created=$(cf_create_zone "$NEW_ZONE") || exit 1
+    ZONE_ID=${created%% *}; NAMESERVERS=${created#* }; ZONE="$ZONE_ID $NEW_ZONE"; ZONE_NAME=$NEW_ZONE
+    ok "$NEW_ZONE Cloudflare'e eklendi (nameserver'lar: $NAMESERVERS)"
+  fi
+  [ -n "$ZONE" ] || return 0
+  step "DNS kaydı (Cloudflare)"
+  CF_RECORD_IDS=$(cf_upsert_a "$ZONE_ID" "$DOMAIN" "$PUBLIC_IP" "$NAME") || exit 1
+  if [ "$WWW" = 1 ]; then
+    local www_id; www_id=$(cf_upsert_a "$ZONE_ID" "www.$DOMAIN" "$PUBLIC_IP" "$NAME") || exit 1
+    CF_RECORD_IDS="$CF_RECORD_IDS $www_id"
+  fi
+  ok "$DOMAIN$([ "$WWW" = 1 ] && echo " ve www.$DOMAIN") → $PUBLIC_IP"
+}
+dns_wait_or_warn() {
+  if [ -n "$ZONE" ] && [ "$(zone_status "$ZONE_ID")" = active ]; then
+    wait_dns "$DOMAIN" "$PUBLIC_IP" && ok "DNS yayıldı" || warn "DNS henüz yayılmadı; HTTPS sertifikası birkaç dakika içinde kendiliğinden alınır."
+  elif [ -n "$ZONE" ]; then
+    warn "$ZONE_NAME Cloudflare'de henüz aktif değil (nameserver değişikliği bekleniyor); HTTPS o zaman kendiliğinden gelir."
+  fi
+}
+nameserver_box() {
+  [ -n "$NAMESERVERS" ] || return 0
+  echo
+  bold "  ÖNEMLİ — nameserver'ları değiştir:"
+  echo "  $ZONE_NAME alan adını aldığın firmanın panelinde (GoDaddy, Namecheap, Natro, isimtescil…)"
+  echo "  'Nameserver / DNS sunucuları' bölümünü 'özel' yapıp şunları yaz:"
+  for ns in $NAMESERVERS; do echo "      $ns"; done
+  echo "  Değişiklik birkaç dakika ile birkaç saat sürer. Durumu görmek için: yenisite --list"
+  echo "  Aktif olunca https://$DOMAIN kendiliğinden açılır (HTTPS'i web sunucusu kendisi alır)."
+}
+# Site kaydı (yenisite --list / --uninstall / --alanadi için)
+save_site() {
+  install -d -m 700 -o root -g root "$CONF_DIR" "$SITES_DIR"
+  install -m 600 -o root -g root /dev/null "$SITES_DIR/$NAME.env"
+  printf 'NAME=%q\nDOMAIN=%q\nPORT=%q\nCF_ZONE_ID=%q\nCF_ZONE_CREATED=%q\nCF_RECORD_IDS=%q\nGH_KEY_ID=%q\nCREATED=%q\nREDIRECT_HOSTS=%q\nEXTRA_CF_RECORDS=%q\n' \
+    "$NAME" "$DOMAIN" "$PORT" "${ZONE_ID:-}" "${CF_ZONE_CREATED:-0}" "$CF_RECORD_IDS" "${GH_KEY_ID:-}" "${CREATED:-$(date +%F)}" \
+    "${REDIRECT_HOSTS:-}" "${EXTRA_CF_RECORDS:-}" > "$SITES_DIR/$NAME.env"
+}
+
 # ---------- 1. ön kontroller ----------
 [ "$(id -u)" = 0 ] || die "Root olarak çalıştır: curl -fsSL https://raw.githubusercontent.com/starynightthomas/shop-installer/main/install.sh | sudo bash"
 command -v apt-get > /dev/null || die "Bu kurulum Ubuntu/Debian içindir (apt bulunamadı)."
@@ -218,7 +351,8 @@ if [ "$LIST" = 1 ]; then
     ( . "$f"
       zs=''; if [ -n "${CF_ZONE_ID:-}" ] && [ -n "$CF_API_TOKEN" ]; then zs=$(zone_status "$CF_ZONE_ID"); fi
       case "$zs" in active) zs='Cloudflare: aktif' ;; pending) zs="Cloudflare: nameserver bekleniyor ($(cf_api GET "/zones/$CF_ZONE_ID" | jq -r '.result.name_servers | join(", ")'))" ;; '') ;; *) zs="Cloudflare: $zs" ;; esac
-      printf '  %-14s https://%-32s servis: %-8s %s\n' "$NAME" "$DOMAIN" "$(systemctl is-active "$NAME" 2> /dev/null)" "$zs" )
+      printf '  %-14s https://%-32s servis: %-8s %s\n' "$NAME" "$DOMAIN" "$(systemctl is-active "$NAME" 2> /dev/null)" "$zs"
+      if [ -n "${REDIRECT_HOSTS:-}" ]; then printf '  %-14s yönlenen eski adresler: %s\n' '' "$REDIRECT_HOSTS"; fi )
   done
   [ "$found" = 1 ] || echo "  Henüz site yok. Kurmak için: yenisite"
   exit 0
@@ -262,6 +396,7 @@ if [ -n "$UNINSTALL" ]; then
     # shellcheck disable=SC1090
     ( . "$SITES_DIR/$N.env"
       for id in $CF_RECORD_IDS; do cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$id" > /dev/null 2>&1 || warn "DNS kaydı silinemedi ($id); Cloudflare'den elle silebilirsin."; done
+      for zr in ${EXTRA_CF_RECORDS:-}; do cf_api DELETE "/zones/${zr%%:*}/dns_records/${zr#*:}" > /dev/null 2>&1 || warn "Eski alan adının DNS kaydı silinemedi (${zr#*:})."; done
       if [ -n "${GH_KEY_ID:-}" ]; then gh_api DELETE "/repos/$GITHUB_REPO/keys/$GH_KEY_ID" > /dev/null 2>&1 || warn "GitHub anahtarı silinemedi; $REPO_KEYS_URL"; fi )
     if grep -qs '^CF_ZONE_CREATED=1' "$SITES_DIR/$N.env"; then
       echo "  Not: alan adının kendisi Cloudflare hesabında kaldı (başka kayıtların olabilir); istersen Cloudflare'den silebilirsin."
@@ -272,6 +407,107 @@ if [ -n "$UNINSTALL" ]; then
     echo "  GitHub'daki '$N' deploy anahtarını da silebilirsin: $REPO_KEYS_URL"
   fi
   ok "$N kaldırıldı. Diğer siteler ve paylaşılan güncelleyici yerinde."
+  exit 0
+fi
+
+# ---------- alan adı değişikliği ----------
+if [ -n "$CHANGE" ]; then
+  N=$CHANGE
+  [[ $N =~ ^[a-z][a-z0-9-]{1,19}$ ]] || die "Geçersiz ad: $N"
+  [ -f "$SITES_DIR/$N.env" ] || die "'$N' yenisite ile kurulmuş bir site değil. Kurulu siteler: yenisite --list"
+  ARG_DOMAIN=$DOMAIN
+  # shellcheck disable=SC1090
+  . "$SITES_DIR/$N.env"
+  OLD_DOMAIN=$DOMAIN OLD_ZONE_ID=$CF_ZONE_ID OLD_RECORD_IDS=$CF_RECORD_IDS OLD_ZONE_CREATED=${CF_ZONE_CREATED:-0}
+  if [ -f "/etc/caddy/sites/$NAME.caddy" ]; then WEB=caddy
+  elif [ -e "/etc/nginx/sites-available/$NAME" ] || [ -e "/etc/nginx/conf.d/$NAME.conf" ]; then WEB=nginx
+  elif [ -e "/etc/apache2/sites-available/$NAME.conf" ]; then WEB=apache
+  else die "$NAME için web sunucusu ayarı bulunamadı."; fi
+  OLD_HOSTS=$OLD_DOMAIN
+  if [ "$WEB" = caddy ] && grep -q "^www\.$OLD_DOMAIN " "/etc/caddy/sites/$NAME.caddy"; then OLD_HOSTS="$OLD_DOMAIN www.$OLD_DOMAIN"; fi
+
+  bold "Alan adı değişikliği: $NAME"
+  echo "Şu anki adres: https://$OLD_DOMAIN"
+  DOMAIN=${ARG_DOMAIN,,}
+  while ! [[ $DOMAIN =~ $DOMAIN_RE ]] || [ "$DOMAIN" = "$OLD_DOMAIN" ]; do
+    [ -n "$DOMAIN" ] && warn "Geçersiz ya da aynı alan adı: $DOMAIN"
+    [ "$YES" = 1 ] && die "Geçerli ve farklı bir --domain ver."
+    DOMAIN=$(ask "Yeni alan adı (ör. yenimagaza.com): ")
+    DOMAIN=${DOMAIN#http://}; DOMAIN=${DOMAIN#https://}; DOMAIN=${DOMAIN%%/*}; DOMAIN=${DOMAIN#www.}; DOMAIN=${DOMAIN,,}
+  done
+  PUBLIC_IP=$(curl -fsS --max-time 5 https://api.ipify.org 2> /dev/null || true)
+  dns_plan
+  REDIRECT=0
+  if [ "$WEB" = caddy ]; then
+    confirm "Eski adres ($OLD_DOMAIN) yeni adrese yönlensin mi? (eski linkler ve Google kayıtları kaybolmaz)" && REDIRECT=1
+  fi
+  echo
+  bold "Plan"
+  echo "  Site          : $NAME"
+  echo "  Eski adres    : https://$OLD_DOMAIN → $([ "$REDIRECT" = 1 ] && echo "https://$DOMAIN adresine yönlenecek" || echo "kaldırılacak (DNS kayıtları da silinir)")"
+  echo "  Yeni adres    : https://$DOMAIN$([ "$WWW" = 1 ] && echo " (www.$DOMAIN buraya yönlenir)")"
+  dns_plan_text
+  echo "  HTTPS         : yeni alan adı için sertifika otomatik alınır"
+  if [ "$DRY" = 1 ]; then echo; ok "Deneme modu: hiçbir şey değiştirilmedi."; exit 0; fi
+  echo
+  confirm "Değişiklik yapılsın mı?" || die "Vazgeçildi; hiçbir şey değiştirilmedi."
+
+  dns_apply
+  CF_ZONE_CREATED=$([ -n "$NEW_ZONE" ] && echo 1 || echo 0)
+  if [ "$REDIRECT" = 1 ]; then
+    REDIRECT_HOSTS=$(printf '%s\n' ${REDIRECT_HOSTS:-} $OLD_HOSTS | { grep -vxF -e "$DOMAIN" -e "www.$DOMAIN" || true; } | sort -u | tr '\n' ' ' | sed 's/ $//')
+    for id in $OLD_RECORD_IDS; do EXTRA_CF_RECORDS="${EXTRA_CF_RECORDS:-} $OLD_ZONE_ID:$id"; done
+    EXTRA_CF_RECORDS=${EXTRA_CF_RECORDS# }
+  fi
+
+  step "Web sunucusu ve HTTPS"
+  dns_wait_or_warn
+  case "$WEB" in
+    caddy)
+      F=/etc/caddy/sites/$NAME.caddy
+      cp -a "$F" "$F.eski"
+      caddy_site > "$F"
+      if ! caddy_valid; then mv -f "$F.eski" "$F"; die "Caddy ayarı geçersiz çıktı; eski hali geri yüklendi, site eski adresinde çalışmaya devam ediyor."; fi
+      rm -f "$F.eski"
+      systemctl reload caddy
+      ;;
+    nginx)
+      F=$(nginx_site_path)
+      cp -a "$F" "$F.eski"
+      write_nginx_site
+      if ! nginx -t > /dev/null 2>&1; then mv -f "$F.eski" "$F"; die "Nginx ayarı geçersiz çıktı; eski hali geri yüklendi."; fi
+      rm -f "$F.eski"
+      systemctl reload nginx
+      certbot_for nginx
+      ;;
+    apache)
+      F=/etc/apache2/sites-available/$NAME.conf
+      cp -a "$F" "$F.eski"
+      a2dissite -q "$NAME-le-ssl" > /dev/null 2>&1 || true
+      rm -f "/etc/apache2/sites-available/$NAME-le-ssl.conf"
+      write_apache_site
+      if ! apachectl configtest > /dev/null 2>&1; then mv -f "$F.eski" "$F"; die "Apache ayarı geçersiz çıktı; eski hali geri yüklendi."; fi
+      rm -f "$F.eski"
+      systemctl reload apache2
+      certbot_for apache
+      ;;
+  esac
+  ok "$DOMAIN → $NAME"
+
+  if [ "$REDIRECT" != 1 ] && [ -n "$OLD_ZONE_ID" ]; then
+    for id in $OLD_RECORD_IDS; do cf_api DELETE "/zones/$OLD_ZONE_ID/dns_records/$id" > /dev/null 2>&1 || warn "Eski DNS kaydı silinemedi ($id)."; done
+    ok "Eski alan adının DNS kayıtları silindi"
+    [ "$OLD_ZONE_CREATED" = 1 ] && echo "  Not: $OLD_DOMAIN alan adı Cloudflare hesabında kaldı; istersen Cloudflare'den silebilirsin."
+  fi
+  sed -i "s|^Description=.*|Description=Shop $NAME ($DOMAIN)|" "/etc/systemd/system/$NAME.service" && systemctl daemon-reload
+  save_site
+
+  echo
+  bold "Alan adı değişti: https://$DOMAIN"
+  [ "$REDIRECT" = 1 ] && echo "  https://$OLD_DOMAIN artık https://$DOMAIN adresine yönleniyor."
+  echo "  Yönetim paneli:  https://$DOMAIN$ADMIN_PATH   (giriş bilgilerin aynı)"
+  echo "  Panelde E-posta bildirimleri'ndeki gönderen adres eski alan adındaysa onu da değiştirmeyi unutma."
+  nameserver_box
   exit 0
 fi
 
@@ -288,7 +524,6 @@ bold "Yeni site"
 echo "Sunucundaki diğer sitelere dokunulmaz. Ne yapılacağı gösterilip başlamadan önce onay istenir."
 
 # ---------- 2. sorular ----------
-DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$'
 DOMAIN=${DOMAIN,,}
 while ! [[ $DOMAIN =~ $DOMAIN_RE ]]; do
   [ -n "$DOMAIN" ] && warn "Geçersiz alan adı: $DOMAIN"
@@ -327,24 +562,7 @@ fi
 
 PUBLIC_IP=$(curl -fsS --max-time 5 https://api.ipify.org 2> /dev/null || true)
 DOMAIN_IP=$(getent ahostsv4 "$DOMAIN" 2> /dev/null | awk 'NR==1{print $1}' || true)
-# Alan adı Cloudflare hesabındaysa DNS kaydı otomatik açılır; kök alan adıysa www. de eklenir.
-ZONE=''
-if [ -n "$CF_API_TOKEN" ]; then ZONE=$(cf_zone_for "$DOMAIN"); fi
-ZONE_ID=${ZONE%% *}
-ZONE_NAME=${ZONE#* }
-if [ -n "$ZONE" ] && [ -z "$PUBLIC_IP" ]; then die "Sunucunun dış IP adresi bulunamadı (internet bağlantısını kontrol et)."; fi
-NEW_ZONE=''
-if [ -z "$ZONE" ] && [ -n "$CF_API_TOKEN" ] && [ -n "$CF_ACCOUNT_ID" ]; then
-  NEW_ZONE=$(registrable "$DOMAIN")
-  [ -n "$PUBLIC_IP" ] || die "Sunucunun dış IP adresi bulunamadı (internet bağlantısını kontrol et)."
-fi
-WWW=0
-if [ -n "$NEW_ZONE" ] && [ "$DOMAIN" = "$NEW_ZONE" ]; then WWW=1
-elif [ -n "$ZONE" ] && [ "$DOMAIN" = "$ZONE_NAME" ]; then WWW=1
-# Cloudflare'de değilse: www. de bu sunucuyu gösteriyorsa eklenir (yoksa sertifika boşuna denenmesin).
-elif [ -n "$PUBLIC_IP" ] && [ "$(getent ahostsv4 "www.$DOMAIN" 2> /dev/null | awk 'NR==1{print $1}')" = "$PUBLIC_IP" ]; then WWW=1; fi
-WWW_HOST=''
-if [ "$WWW" = 1 ]; then WWW_HOST="www.$DOMAIN"; fi
+dns_plan
 case "$WEB" in
   none) WEB_TEXT="Web sunucusu yok → Caddy kurulacak (HTTPS otomatik)" ;;
   caddy) WEB_TEXT="Caddy çalışıyor → /etc/caddy/sites/$NAME.caddy eklenecek" ;;
@@ -361,14 +579,7 @@ echo "  Node.js       : $NODE_MAJOR (sadece bu mağazanın klasörüne; sistemde
 echo "  Web sunucusu  : $WEB_TEXT"
 echo "  Güncelleme    : panelden (günlük kontrol, tek tık, otomatik yedek ve geri alma)"
 echo "  Yedek         : her gün veritabanı + görseller, 14 gün ($BASE/backups)"
-if [ -n "$ZONE" ]; then
-  echo "  DNS           : Cloudflare ($ZONE_NAME) → $DOMAIN$([ "$WWW" = 1 ] && echo " ve www.$DOMAIN") → $PUBLIC_IP (otomatik)"
-elif [ -n "$NEW_ZONE" ]; then
-  echo "  DNS           : $NEW_ZONE Cloudflare hesabına eklenecek, $DOMAIN$([ "$WWW" = 1 ] && echo " ve www.$DOMAIN") → $PUBLIC_IP"
-  echo "                  (sonunda alan adını aldığın yerde değiştireceğin nameserver'lar yazılacak)"
-else
-  echo "  DNS           : $DOMAIN bu Cloudflare hesabında yok → kaydı elle yapman gerekecek"
-fi
+dns_plan_text
 echo "  GitHub        : bu siteye salt okunur erişim anahtarı otomatik eklenecek"
 if [ -z "$ZONE" ] && [ -z "$NEW_ZONE" ] && [ -n "$PUBLIC_IP" ] && [ "$DOMAIN_IP" != "$PUBLIC_IP" ]; then
   echo
@@ -390,25 +601,8 @@ fi
 ok "Gerekli paketler hazır (sadece eksikler kuruldu; sistem paketleri güncellenmedi)"
 
 # ---------- DNS (Cloudflare) ----------
-CF_RECORD_IDS='' NAMESERVERS=''
-if [ -n "$NEW_ZONE" ]; then
-  step "Alan adı Cloudflare'e ekleniyor"
-  CREATED_ZONE=$(cf_create_zone "$NEW_ZONE") || exit 1
-  ZONE_ID=${CREATED_ZONE%% *}
-  NAMESERVERS=${CREATED_ZONE#* }
-  ZONE="$ZONE_ID $NEW_ZONE"
-  ZONE_NAME=$NEW_ZONE
-  ok "$NEW_ZONE Cloudflare'e eklendi (nameserver'lar: $NAMESERVERS)"
-fi
-if [ -n "$ZONE" ]; then
-  step "DNS kaydı (Cloudflare)"
-  CF_RECORD_IDS=$(cf_upsert_a "$ZONE_ID" "$DOMAIN" "$PUBLIC_IP" "$NAME") || exit 1
-  if [ "$WWW" = 1 ]; then
-    WWW_ID=$(cf_upsert_a "$ZONE_ID" "www.$DOMAIN" "$PUBLIC_IP" "$NAME") || exit 1
-    CF_RECORD_IDS="$CF_RECORD_IDS $WWW_ID"
-  fi
-  ok "$DOMAIN$([ "$WWW" = 1 ] && echo " ve www.$DOMAIN") → $PUBLIC_IP"
-fi
+dns_apply
+CF_ZONE_CREATED=$([ -n "$NEW_ZONE" ] && echo 1 || echo 0)
 
 # ---------- 5. kullanıcı ve klasörler ----------
 step "Kullanıcı ve klasörler"
@@ -541,35 +735,7 @@ ok "$NAME servisi çalışıyor (127.0.0.1:$PORT)"
 
 # ---------- 10. web sunucusu + HTTPS ----------
 step "Web sunucusu ve HTTPS"
-if [ -n "$ZONE" ] && [ "$(zone_status "$ZONE_ID")" = active ]; then
-  wait_dns "$DOMAIN" "$PUBLIC_IP" && ok "DNS yayıldı" || warn "DNS henüz yayılmadı; HTTPS sertifikası birkaç dakika içinde kendiliğinden alınır."
-elif [ -n "$ZONE" ]; then
-  warn "$ZONE_NAME Cloudflare'de henüz aktif değil (nameserver değişikliği bekleniyor); HTTPS o zaman kendiliğinden gelir."
-fi
-caddy_site() {
-  cat <<EOF
-# Mağaza: $NAME (install.sh)
-$DOMAIN {
-	encode zstd gzip
-	request_body {
-		max_size 12MB
-	}
-	reverse_proxy 127.0.0.1:$PORT {
-		lb_try_duration 10s
-		lb_try_interval 250ms
-	}
-	log
-}
-EOF
-  if [ "$WWW" = 1 ]; then printf 'www.%s {\n\tredir https://%s{uri} permanent\n}\n' "$DOMAIN" "$DOMAIN"; fi
-}
-caddy_valid() { caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile > /dev/null 2>&1; }
-certbot_for() { # $1 eklenti (nginx|apache)
-  local names=(-d "$DOMAIN")
-  if [ "$WWW" = 1 ]; then names+=(-d "www.$DOMAIN"); fi
-  certbot "--$1" -n --agree-tos --register-unsafely-without-email --redirect "${names[@]}" > /dev/null 2>&1 \
-    || warn "HTTPS sertifikası alınamadı (DNS henüz bu sunucuyu göstermiyor olabilir). Sonra: certbot --$1 -d $DOMAIN"
-}
+dns_wait_or_warn
 case "$WEB" in
   none)
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https gnupg > /dev/null
@@ -599,23 +765,8 @@ case "$WEB" in
     ;;
   nginx)
     { dpkg -s certbot && dpkg -s python3-certbot-nginx; } > /dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot python3-certbot-nginx > /dev/null
-    SITE=/etc/nginx/sites-available/$NAME
-    [ -d /etc/nginx/sites-available ] || SITE=/etc/nginx/conf.d/$NAME.conf
-    cat > "$SITE" <<EOF
-# Mağaza: $NAME (install.sh)
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $DOMAIN $WWW_HOST;
-    client_max_body_size 12m;
-    location / {
-        proxy_pass http://127.0.0.1:$PORT;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-EOF
+    SITE=$(nginx_site_path)
+    write_nginx_site
     if [ -d /etc/nginx/sites-enabled ]; then ln -sf "$SITE" "/etc/nginx/sites-enabled/$NAME"; fi
     if ! nginx -t > /dev/null 2>&1; then
       rm -f "$SITE" "/etc/nginx/sites-enabled/$NAME"
@@ -628,17 +779,7 @@ EOF
     { dpkg -s certbot && dpkg -s python3-certbot-apache; } > /dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot python3-certbot-apache > /dev/null
     a2enmod -q proxy proxy_http headers > /dev/null
     SITE=/etc/apache2/sites-available/$NAME.conf
-    cat > "$SITE" <<EOF
-# Mağaza: $NAME (install.sh)
-<VirtualHost *:80>
-    ServerName $DOMAIN
-$(if [ "$WWW" = 1 ]; then echo "    ServerAlias www.$DOMAIN"; fi)
-    ProxyPreserveHost On
-    RequestHeader set X-Forwarded-Proto expr=%{REQUEST_SCHEME}
-    ProxyPass / http://127.0.0.1:$PORT/
-    ProxyPassReverse / http://127.0.0.1:$PORT/
-</VirtualHost>
-EOF
+    write_apache_site
     a2ensite -q "$NAME" > /dev/null
     if ! apachectl configtest > /dev/null 2>&1; then
       a2dissite -q "$NAME" > /dev/null
@@ -692,11 +833,8 @@ ok "Panelden güncelleme ve günlük yedek açık"
 # Bu sunucuda sonraki mağazalar için kısa komut: yenisite (her seferinde en güncel kurulum script'ini indirir).
 install_yenisite
 
-# ---------- site kaydı (yenisite --list / --uninstall için) ----------
-install -d -m 700 -o root -g root "$CONF_DIR" "$SITES_DIR"
-install -m 600 -o root -g root /dev/null "$SITES_DIR/$NAME.env"
-printf 'NAME=%q\nDOMAIN=%q\nPORT=%q\nCF_ZONE_ID=%q\nCF_ZONE_CREATED=%q\nCF_RECORD_IDS=%q\nGH_KEY_ID=%q\nCREATED=%q\n' \
-  "$NAME" "$DOMAIN" "$PORT" "${ZONE_ID:-}" "$([ -n "$NEW_ZONE" ] && echo 1 || echo 0)" "$CF_RECORD_IDS" "$GH_KEY_ID" "$(date +%F)" > "$SITES_DIR/$NAME.env"
+# ---------- site kaydı ----------
+save_site
 
 # ---------- bitti ----------
 echo
@@ -708,15 +846,7 @@ echo "     (kurulum ekranı bunu ister; sunucuda $ENV dosyasında da yazar)"
 echo "  3) Mağaza adını, logoyu ve yönetici hesabını gir."
 echo
 echo "  Yönetim paneli:     https://$DOMAIN$ADMIN_PATH"
-if [ -n "$NAMESERVERS" ]; then
-  echo
-  bold "  ÖNEMLİ — nameserver'ları değiştir:"
-  echo "  $ZONE_NAME alan adını aldığın firmanın panelinde (GoDaddy, Namecheap, Natro, isimtescil…)"
-  echo "  'Nameserver / DNS sunucuları' bölümünü 'özel' yapıp şunları yaz:"
-  for ns in $NAMESERVERS; do echo "      $ns"; done
-  echo "  Değişiklik birkaç dakika ile birkaç saat sürer. Durumu görmek için: yenisite --list"
-  echo "  Aktif olunca https://$DOMAIN/setup kendiliğinden açılır (HTTPS'i Caddy kendisi alır)."
-fi
+nameserver_box
 echo "  Servis günlüğü:     journalctl -u $NAME -f"
 if [ -z "$ZONE" ] && [ -n "$PUBLIC_IP" ] && [ "$DOMAIN_IP" != "$PUBLIC_IP" ]; then
   echo
