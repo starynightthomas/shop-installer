@@ -55,6 +55,20 @@ name_problem() {
   fi
 }
 
+INSTALLER_URL=https://raw.githubusercontent.com/starynightthomas/shop-installer/main/install.sh
+
+# /usr/local/bin/yenisite: "yenisite" yazınca yeni mağaza kurar, "yenisite --uninstall <ad>" kaldırır.
+install_yenisite() {
+  cat > /usr/local/bin/yenisite <<EOF
+#!/bin/sh
+# Bu sunucuya yeni bir mağaza kurar (en güncel kurulum script'iyle). Kaldırmak için: yenisite --uninstall <ad>
+[ "\$(id -u)" = 0 ] || exec sudo "\$0" "\$@"
+SCRIPT=\$(curl -fsSL $INSTALLER_URL) || { echo "Kurulum script'i indirilemedi." >&2; exit 1; }
+exec bash -c "\$SCRIPT" yenisite "\$@"
+EOF
+  chmod 755 /usr/local/bin/yenisite
+}
+
 # ---------- 1. ön kontroller ----------
 [ "$(id -u)" = 0 ] || die "Root olarak çalıştır: curl -fsSL https://raw.githubusercontent.com/starynightthomas/shop-installer/main/install.sh | sudo bash"
 command -v apt-get > /dev/null || die "Bu kurulum Ubuntu/Debian içindir (apt bulunamadı)."
@@ -452,6 +466,9 @@ chmod 755 "/etc/cron.daily/$NAME-backup"
 systemctl daemon-reload
 systemctl enable -q --now "shop-updater@$NAME.path" "shop-updater-check@$NAME.timer"
 ok "Panelden güncelleme ve günlük yedek açık"
+
+# Bu sunucuda sonraki mağazalar için kısa komut: yenisite (her seferinde en güncel kurulum script'ini indirir).
+install_yenisite
 
 # ---------- bitti ----------
 echo
