@@ -13,19 +13,22 @@
 # Kaldırmak için: --uninstall <ad>   (önce /root'a son yedek alınır, adı yazarak onay istenir)
 set -euo pipefail
 
-REPO=git@github.com:starynightthomas/go-lob.git
+GITHUB_REPO=starynightthomas/go-lob
+REPO=git@github.com:$GITHUB_REPO.git
 REPO_KEYS_URL=https://github.com/starynightthomas/go-lob/settings/keys
 GITHUB_ED25519=SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU
 NODE_MAJOR=22
 ADMIN_PATH=/minad
 
-DOMAIN='' NAME='' YES=0 DRY=0 UNINSTALL=''
+DOMAIN='' NAME='' YES=0 DRY=0 UNINSTALL='' SETUP=0 LIST=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --domain) DOMAIN=${2:-}; shift 2 ;;
     --name) NAME=${2:-}; shift 2 ;;
     --yes|-y) YES=1; shift ;;
     --dry-run) DRY=1; shift ;;
+    --setup) SETUP=1; shift ;;
+    --list) LIST=1; shift ;;
     --uninstall) UNINSTALL=${2:-}; shift 2 ;;
     *) echo "Bilinmeyen seçenek: $1" >&2; exit 2 ;;
   esac
@@ -69,6 +72,122 @@ EOF
   chmod 755 /usr/local/bin/yenisite
 }
 
+# ---------- sunucu ayarları: Cloudflare ve GitHub anahtarları ----------
+# Sunucu kurulumunda bir kez sorulur, sadece root'un okuyabileceği dosyada saklanır. Her "yenisite" bunları
+# kullanarak DNS kaydını açar ve gizli depoya o sitenin salt okunur anahtarını ekler.
+CONF_DIR=/etc/shop-installer
+CRED=$CONF_DIR/credentials
+SITES_DIR=$CONF_DIR/sites
+CF_API_TOKEN='' CF_ACCOUNT_ID='' GITHUB_TOKEN=''
+
+ask_secret() { local reply; read -r -s -p "$1" reply < /dev/tty; echo > /dev/tty; printf %s "$reply"; }
+load_creds() { if [ -f "$CRED" ]; then . "$CRED"; fi; }
+
+cf_api() { # METHOD PATH [JSON]
+  curl -fsS --max-time 20 -X "$1" -H "Authorization: Bearer $CF_API_TOKEN" -H 'Content-Type: application/json' \
+    "https://api.cloudflare.com/client/v4$2" ${3:+--data "$3"}
+}
+gh_api() { # METHOD PATH [JSON]
+  curl -fsS --max-time 20 -X "$1" -H "Authorization: Bearer $GITHUB_TOKEN" -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' "https://api.github.com$2" ${3:+--data "$3"}
+}
+
+check_cf_token() { cf_api GET '/zones?per_page=50' 2> /dev/null | jq -e '.success' > /dev/null 2>&1; }
+check_gh_token() { gh_api GET "/repos/$GITHUB_REPO/keys" > /dev/null 2>&1; }
+
+server_setup() {
+  bold "Sunucu kurulumu (bir kez)"
+  echo "Siteleri tamamen otomatik kurabilmem için iki anahtar gerekiyor. Yazdıkların ekranda görünmez;"
+  echo "sadece bu sunucuda, root'un okuyabileceği $CRED dosyasında saklanır."
+  echo
+  bold "1) Cloudflare API anahtarı"
+  echo "   dash.cloudflare.com → sağ üst profil → API Tokens → Create Token → Custom token → Get started"
+  echo "   Permissions:  Zone · Zone · Edit   ve   Zone · DNS · Edit   (istersen: Account · Account Settings · Read)"
+  echo "   Zone Resources: Include · All zones from an account · <hesabın>  → Continue → Create Token → kopyala."
+  until [ -n "$CF_API_TOKEN" ] && check_cf_token; do
+    [ -n "$CF_API_TOKEN" ] && warn "Bu anahtarla Cloudflare'e bağlanılamadı (yanlış ya da yetkisi eksik)."
+    CF_API_TOKEN=$(ask_secret "   Cloudflare API anahtarı: ")
+  done
+  ok "Cloudflare: $(cf_api GET '/zones?per_page=50' | jq -r '[.result[].name] | join(", ") | if . == "" then "henüz alan adı yok" else . end')"
+  # Yeni alan adlarını hesaba ekleyebilmek için hesap numarası: anahtar okuyabiliyorsa otomatik, yoksa sorulur.
+  CF_ACCOUNT_ID=$(cf_api GET '/accounts?per_page=5' 2> /dev/null | jq -r 'if (.result | length) == 1 then .result[0].id else empty end') || CF_ACCOUNT_ID=''
+  [ -n "$CF_ACCOUNT_ID" ] || CF_ACCOUNT_ID=$(cf_api GET '/zones?per_page=1' 2> /dev/null | jq -r '.result[0].account.id // empty') || CF_ACCOUNT_ID=''
+  while ! [[ $CF_ACCOUNT_ID =~ ^[0-9a-f]{32}$ ]]; do
+    echo "   Cloudflare hesap numarası (Account ID): dash.cloudflare.com açıkken adres çubuğundaki 32 karakterlik kod."
+    CF_ACCOUNT_ID=$(ask "   Account ID: ")
+  done
+  ok "Cloudflare hesabı: $CF_ACCOUNT_ID"
+  echo
+  bold "2) GitHub anahtarı"
+  echo "   github.com/settings/personal-access-tokens/new → Repository access: Only select → $GITHUB_REPO"
+  echo "   Permissions → Repository → Administration: Read and write → Generate → anahtarı kopyala."
+  until [ -n "$GITHUB_TOKEN" ] && check_gh_token; do
+    [ -n "$GITHUB_TOKEN" ] && warn "Bu anahtarla $GITHUB_REPO deposunun anahtarlarına erişilemedi (Administration: Read and write gerekli)."
+    GITHUB_TOKEN=$(ask_secret "   GitHub anahtarı: ")
+  done
+  ok "GitHub: $GITHUB_REPO erişimi var"
+  install -d -m 700 -o root -g root "$CONF_DIR" "$SITES_DIR"
+  install -m 600 -o root -g root /dev/null "$CRED"
+  printf 'CF_API_TOKEN=%q\nCF_ACCOUNT_ID=%q\nGITHUB_TOKEN=%q\n' "$CF_API_TOKEN" "$CF_ACCOUNT_ID" "$GITHUB_TOKEN" > "$CRED"
+  install_yenisite
+  ok "Anahtarlar kaydedildi; 'yenisite' komutu hazır."
+}
+
+# Alan adının Cloudflare'deki bölgesi (en uzun eşleşen): "zone_id zone_name" ya da boş.
+cf_zone_for() {
+  local d=$1
+  while [[ $d == *.* ]]; do
+    local r; r=$(cf_api GET "/zones?name=$d" 2> /dev/null | jq -r '.result[0] | select(.) | "\(.id) \(.name)"') || r=''
+
+    if [ -n "$r" ]; then printf %s "$r"; return; fi
+    d=${d#*.}
+  done
+}
+
+# Alan adının kayıtlı kökü: magaza.example.com → example.com, shop.example.com.tr → example.com.tr
+registrable() {
+  local d=$1
+  case ".$d" in
+    *.com.tr|*.net.tr|*.org.tr|*.gen.tr|*.web.tr|*.co.uk|*.org.uk|*.com.au|*.net.au|*.co.nz|*.com.br|*.co.jp|*.co.za|*.com.mx)
+      while [ "$(printf %s "$d" | tr -cd . | wc -c)" -gt 2 ]; do d=${d#*.}; done ;;
+    *) while [ "$(printf %s "$d" | tr -cd . | wc -c)" -gt 1 ]; do d=${d#*.}; done ;;
+  esac
+  printf %s "$d"
+}
+
+# Alan adını Cloudflare hesabına ekler; "zone_id ns1 ns2" yazar.
+cf_create_zone() { # alan_adı
+  local res; res=$(curl -sS --max-time 20 -X POST -H "Authorization: Bearer $CF_API_TOKEN" -H 'Content-Type: application/json' \
+    https://api.cloudflare.com/client/v4/zones --data "$(jq -nc --arg n "$1" --arg a "$CF_ACCOUNT_ID" '{name:$n,account:{id:$a},type:"full"}')")
+  if [ "$(printf %s "$res" | jq -r .success)" != true ]; then
+    die "$1 Cloudflare'e eklenemedi: $(printf %s "$res" | jq -r '[.errors[].message] | join("; ")')"
+  fi
+  printf %s "$res" | jq -r '"\(.result.id) \(.result.name_servers | join(" "))"'
+}
+
+zone_status() { cf_api GET "/zones/$1" 2> /dev/null | jq -r '.result.status // "?"' || echo '?'; }
+
+# A kaydını açar/günceller (proxy kapalı); başka türde bir kayıt varsa dokunmaz. Kayıt id'sini yazar.
+cf_upsert_a() { # zone_id host ip site
+  local existing other
+  existing=$(cf_api GET "/zones/$1/dns_records?name=$2" | jq -c '.result')
+  other=$(printf %s "$existing" | jq -r '[.[] | select(.type != "A" and .type != "AAAA")][0].type // empty')
+  [ -z "$other" ] || die "$2 için Cloudflare'de zaten bir $other kaydı var; sitelerini bozmamak için dokunmadım."
+  local id; id=$(printf %s "$existing" | jq -r '[.[] | select(.type == "A")][0].id // empty')
+  local body; body=$(jq -nc --arg n "$2" --arg ip "$3" --arg c "yenisite: $4" '{type:"A",name:$n,content:$ip,ttl:1,proxied:false,comment:$c}')
+  if [ -n "$id" ]; then cf_api PUT "/zones/$1/dns_records/$id" "$body" | jq -r '.result.id'
+  else cf_api POST "/zones/$1/dns_records" "$body" | jq -r '.result.id'; fi
+}
+
+# Cloudflare'in kendi çözücüsü kaydı görene kadar bekler (en fazla ~2 dk).
+wait_dns() { # host ip
+  for _ in $(seq 1 40); do
+    [ "$(curl -fsS --max-time 5 -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=$1&type=A" | jq -r '[.Answer[]?.data][0] // empty')" = "$2" ] && return 0
+    sleep 3
+  done
+  return 1
+}
+
 # ---------- 1. ön kontroller ----------
 [ "$(id -u)" = 0 ] || die "Root olarak çalıştır: curl -fsSL https://raw.githubusercontent.com/starynightthomas/shop-installer/main/install.sh | sudo bash"
 command -v apt-get > /dev/null || die "Bu kurulum Ubuntu/Debian içindir (apt bulunamadı)."
@@ -77,6 +196,33 @@ if [ -d /usr/local/cpanel ] || [ -d /usr/local/psa ]; then
   die "Bu sunucuda cPanel/Plesk var: web sunucusu ayarlarını o panel yönetir, script dokunmaz."
 fi
 case "$(uname -m)" in x86_64) NODE_ARCH=x64 ;; aarch64|arm64) NODE_ARCH=arm64 ;; *) die "Desteklenmeyen işlemci: $(uname -m)" ;; esac
+
+# Sadece eksik paketleri kurar (sistem paketleri güncellenmez).
+ensure_pkgs() {
+  local need=() p
+  for p in "$@"; do dpkg -s "$p" > /dev/null 2>&1 || need+=("$p"); done
+  [ ${#need[@]} -eq 0 ] && return 0
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${need[@]}" > /dev/null
+}
+ensure_pkgs curl ca-certificates jq
+load_creds
+
+# ---------- kurulu siteler ----------
+if [ "$LIST" = 1 ]; then
+  bold "Bu sunucudaki siteler"
+  found=0
+  for f in "$SITES_DIR"/*.env; do
+    [ -f "$f" ] || continue
+    found=1
+    ( . "$f"
+      zs=''; if [ -n "${CF_ZONE_ID:-}" ] && [ -n "$CF_API_TOKEN" ]; then zs=$(zone_status "$CF_ZONE_ID"); fi
+      case "$zs" in active) zs='Cloudflare: aktif' ;; pending) zs="Cloudflare: nameserver bekleniyor ($(cf_api GET "/zones/$CF_ZONE_ID" | jq -r '.result.name_servers | join(", ")'))" ;; '') ;; *) zs="Cloudflare: $zs" ;; esac
+      printf '  %-14s https://%-32s servis: %-8s %s\n' "$NAME" "$DOMAIN" "$(systemctl is-active "$NAME" 2> /dev/null)" "$zs" )
+  done
+  [ "$found" = 1 ] || echo "  Henüz site yok. Kurmak için: yenisite"
+  exit 0
+fi
 
 # ---------- kaldırma ----------
 if [ -n "$UNINSTALL" ]; then
@@ -88,6 +234,7 @@ if [ -n "$UNINSTALL" ]; then
   bold "Kaldırılacak: $N"
   echo "  Servis $N, güncelleyici zamanlayıcıları, günlük yedek görevi, web sunucusundaki $N site dosyası,"
   echo "  $N kullanıcısı ve /srv/$N klasörü (kod, veritabanı, fotoğraflar, yedekler)."
+  if [ -f "$SITES_DIR/$N.env" ]; then echo "  Cloudflare'de bu site için açılan DNS kayıtları ve GitHub'daki salt okunur anahtarı."; fi
   FINAL=/root/$N-son-yedek-$(date +%Y%m%d-%H%M%S).tar.gz
   echo "  Önce son yedek alınacak: $FINAL"
   if [ "$YES" != 1 ] && [ "$(ask "Onaylamak için mağaza adını yaz ($N): ")" != "$N" ]; then die "Vazgeçildi; hiçbir şey değiştirilmedi."; fi
@@ -111,13 +258,34 @@ if [ -n "$UNINSTALL" ]; then
   systemctl daemon-reload
   userdel "$N" 2> /dev/null || true
   rm -rf --one-file-system "/srv/$N"
+  if [ -f "$SITES_DIR/$N.env" ]; then
+    # shellcheck disable=SC1090
+    ( . "$SITES_DIR/$N.env"
+      for id in $CF_RECORD_IDS; do cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$id" > /dev/null 2>&1 || warn "DNS kaydı silinemedi ($id); Cloudflare'den elle silebilirsin."; done
+      if [ -n "${GH_KEY_ID:-}" ]; then gh_api DELETE "/repos/$GITHUB_REPO/keys/$GH_KEY_ID" > /dev/null 2>&1 || warn "GitHub anahtarı silinemedi; $REPO_KEYS_URL"; fi )
+    if grep -qs '^CF_ZONE_CREATED=1' "$SITES_DIR/$N.env"; then
+      echo "  Not: alan adının kendisi Cloudflare hesabında kaldı (başka kayıtların olabilir); istersen Cloudflare'den silebilirsin."
+    fi
+    rm -f "$SITES_DIR/$N.env"
+    ok "DNS kayıtları ve GitHub anahtarı silindi"
+  else
+    echo "  GitHub'daki '$N' deploy anahtarını da silebilirsin: $REPO_KEYS_URL"
+  fi
   ok "$N kaldırıldı. Diğer siteler ve paylaşılan güncelleyici yerinde."
-  echo "  GitHub'daki '$N' deploy anahtarını da silebilirsin: $REPO_KEYS_URL"
   exit 0
 fi
 
-bold "Mağaza kurulumu"
-echo "Bu script sunucundaki diğer sitelere dokunmaz. Ne yapacağını gösterip başlamadan önce onay isteyecek."
+# ---------- sunucu kurulumu (anahtarlar yoksa ya da --setup) ----------
+if [ "$SETUP" = 1 ] || [ ! -f "$CRED" ]; then
+  [ "$YES" = 1 ] && [ ! -f "$CRED" ] && die "Önce sunucu kurulumu gerekli: script'i --setup ile, terminalde çalıştır."
+  server_setup
+  echo
+  confirm "Şimdi ilk siteyi kuralım mı?" || { echo "Site kurmak için istediğin zaman: yenisite"; exit 0; }
+  echo
+fi
+
+bold "Yeni site"
+echo "Sunucundaki diğer sitelere dokunulmaz. Ne yapılacağı gösterilip başlamadan önce onay istenir."
 
 # ---------- 2. sorular ----------
 DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$'
@@ -159,9 +327,22 @@ fi
 
 PUBLIC_IP=$(curl -fsS --max-time 5 https://api.ipify.org 2> /dev/null || true)
 DOMAIN_IP=$(getent ahostsv4 "$DOMAIN" 2> /dev/null | awk 'NR==1{print $1}' || true)
-# www. de bu sunucuyu gösteriyorsa eklenir (yoksa sertifika boşuna denenmesin).
+# Alan adı Cloudflare hesabındaysa DNS kaydı otomatik açılır; kök alan adıysa www. de eklenir.
+ZONE=''
+if [ -n "$CF_API_TOKEN" ]; then ZONE=$(cf_zone_for "$DOMAIN"); fi
+ZONE_ID=${ZONE%% *}
+ZONE_NAME=${ZONE#* }
+if [ -n "$ZONE" ] && [ -z "$PUBLIC_IP" ]; then die "Sunucunun dış IP adresi bulunamadı (internet bağlantısını kontrol et)."; fi
+NEW_ZONE=''
+if [ -z "$ZONE" ] && [ -n "$CF_API_TOKEN" ] && [ -n "$CF_ACCOUNT_ID" ]; then
+  NEW_ZONE=$(registrable "$DOMAIN")
+  [ -n "$PUBLIC_IP" ] || die "Sunucunun dış IP adresi bulunamadı (internet bağlantısını kontrol et)."
+fi
 WWW=0
-if [ -n "$PUBLIC_IP" ] && [ "$(getent ahostsv4 "www.$DOMAIN" 2> /dev/null | awk 'NR==1{print $1}')" = "$PUBLIC_IP" ]; then WWW=1; fi
+if [ -n "$NEW_ZONE" ] && [ "$DOMAIN" = "$NEW_ZONE" ]; then WWW=1
+elif [ -n "$ZONE" ] && [ "$DOMAIN" = "$ZONE_NAME" ]; then WWW=1
+# Cloudflare'de değilse: www. de bu sunucuyu gösteriyorsa eklenir (yoksa sertifika boşuna denenmesin).
+elif [ -n "$PUBLIC_IP" ] && [ "$(getent ahostsv4 "www.$DOMAIN" 2> /dev/null | awk 'NR==1{print $1}')" = "$PUBLIC_IP" ]; then WWW=1; fi
 WWW_HOST=''
 if [ "$WWW" = 1 ]; then WWW_HOST="www.$DOMAIN"; fi
 case "$WEB" in
@@ -180,7 +361,16 @@ echo "  Node.js       : $NODE_MAJOR (sadece bu mağazanın klasörüne; sistemde
 echo "  Web sunucusu  : $WEB_TEXT"
 echo "  Güncelleme    : panelden (günlük kontrol, tek tık, otomatik yedek ve geri alma)"
 echo "  Yedek         : her gün veritabanı + görseller, 14 gün ($BASE/backups)"
-if [ -n "$PUBLIC_IP" ] && [ "$DOMAIN_IP" != "$PUBLIC_IP" ]; then
+if [ -n "$ZONE" ]; then
+  echo "  DNS           : Cloudflare ($ZONE_NAME) → $DOMAIN$([ "$WWW" = 1 ] && echo " ve www.$DOMAIN") → $PUBLIC_IP (otomatik)"
+elif [ -n "$NEW_ZONE" ]; then
+  echo "  DNS           : $NEW_ZONE Cloudflare hesabına eklenecek, $DOMAIN$([ "$WWW" = 1 ] && echo " ve www.$DOMAIN") → $PUBLIC_IP"
+  echo "                  (sonunda alan adını aldığın yerde değiştireceğin nameserver'lar yazılacak)"
+else
+  echo "  DNS           : $DOMAIN bu Cloudflare hesabında yok → kaydı elle yapman gerekecek"
+fi
+echo "  GitHub        : bu siteye salt okunur erişim anahtarı otomatik eklenecek"
+if [ -z "$ZONE" ] && [ -z "$NEW_ZONE" ] && [ -n "$PUBLIC_IP" ] && [ "$DOMAIN_IP" != "$PUBLIC_IP" ]; then
   echo
   warn "$DOMAIN şu an ${DOMAIN_IP:-hiçbir adrese} yönleniyor; bu sunucu $PUBLIC_IP."
   warn "HTTPS için DNS'te A kaydını $PUBLIC_IP yap (Cloudflare'de proxy şimdilik kapalı olsun)."
@@ -192,12 +382,33 @@ confirm "Kuruluma başlansın mı?" || die "Vazgeçildi; hiçbir şey değiştir
 # ---------- 4. paketler ----------
 step "Gerekli paketler"
 NEED=()
-for p in git curl ca-certificates sqlite3 xz-utils openssl; do dpkg -s "$p" > /dev/null 2>&1 || NEED+=("$p"); done
+for p in git curl ca-certificates sqlite3 xz-utils openssl jq; do dpkg -s "$p" > /dev/null 2>&1 || NEED+=("$p"); done
 if [ ${#NEED[@]} -gt 0 ]; then
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${NEED[@]}" > /dev/null
 fi
 ok "Gerekli paketler hazır (sadece eksikler kuruldu; sistem paketleri güncellenmedi)"
+
+# ---------- DNS (Cloudflare) ----------
+CF_RECORD_IDS='' NAMESERVERS=''
+if [ -n "$NEW_ZONE" ]; then
+  step "Alan adı Cloudflare'e ekleniyor"
+  CREATED_ZONE=$(cf_create_zone "$NEW_ZONE") || exit 1
+  ZONE_ID=${CREATED_ZONE%% *}
+  NAMESERVERS=${CREATED_ZONE#* }
+  ZONE="$ZONE_ID $NEW_ZONE"
+  ZONE_NAME=$NEW_ZONE
+  ok "$NEW_ZONE Cloudflare'e eklendi (nameserver'lar: $NAMESERVERS)"
+fi
+if [ -n "$ZONE" ]; then
+  step "DNS kaydı (Cloudflare)"
+  CF_RECORD_IDS=$(cf_upsert_a "$ZONE_ID" "$DOMAIN" "$PUBLIC_IP" "$NAME") || exit 1
+  if [ "$WWW" = 1 ]; then
+    WWW_ID=$(cf_upsert_a "$ZONE_ID" "www.$DOMAIN" "$PUBLIC_IP" "$NAME") || exit 1
+    CF_RECORD_IDS="$CF_RECORD_IDS $WWW_ID"
+  fi
+  ok "$DOMAIN$([ "$WWW" = 1 ] && echo " ve www.$DOMAIN") → $PUBLIC_IP"
+fi
 
 # ---------- 5. kullanıcı ve klasörler ----------
 step "Kullanıcı ve klasörler"
@@ -234,6 +445,12 @@ SCAN=$(ssh-keyscan -t ed25519 github.com 2> /dev/null)
 printf '%s\n' "$SCAN" > "$BASE/.ssh/known_hosts"
 chown -R "$NAME:$NAME" "$BASE/.ssh"
 chmod 600 "$BASE/.ssh/config" "$BASE/.ssh/known_hosts"
+GH_KEY_ID=''
+if [ -n "$GITHUB_TOKEN" ] && ! as_app git ls-remote --exit-code "$REPO" HEAD > /dev/null 2>&1; then
+  GH_KEY_ID=$(gh_api POST "/repos/$GITHUB_REPO/keys" "$(jq -nc --arg t "$NAME ($DOMAIN)" --arg k "$(cat "$KEY.pub")" '{title:$t,key:$k,read_only:true}')" | jq -r '.id // empty' || true)
+  [ -n "$GH_KEY_ID" ] && ok "GitHub'a salt okunur anahtar eklendi" || warn "GitHub anahtarı otomatik eklenemedi; elle eklemen gerekecek."
+  for _ in 1 2 3 4 5; do as_app git ls-remote --exit-code "$REPO" HEAD > /dev/null 2>&1 && break; sleep 2; done
+fi
 until as_app git ls-remote --exit-code "$REPO" HEAD > /dev/null 2>&1; do
   echo
   bold "Bu sunucunun koda erişmesi için aşağıdaki anahtarı GitHub'a ekle:"
@@ -324,6 +541,11 @@ ok "$NAME servisi çalışıyor (127.0.0.1:$PORT)"
 
 # ---------- 10. web sunucusu + HTTPS ----------
 step "Web sunucusu ve HTTPS"
+if [ -n "$ZONE" ] && [ "$(zone_status "$ZONE_ID")" = active ]; then
+  wait_dns "$DOMAIN" "$PUBLIC_IP" && ok "DNS yayıldı" || warn "DNS henüz yayılmadı; HTTPS sertifikası birkaç dakika içinde kendiliğinden alınır."
+elif [ -n "$ZONE" ]; then
+  warn "$ZONE_NAME Cloudflare'de henüz aktif değil (nameserver değişikliği bekleniyor); HTTPS o zaman kendiliğinden gelir."
+fi
 caddy_site() {
   cat <<EOF
 # Mağaza: $NAME (install.sh)
@@ -470,6 +692,12 @@ ok "Panelden güncelleme ve günlük yedek açık"
 # Bu sunucuda sonraki mağazalar için kısa komut: yenisite (her seferinde en güncel kurulum script'ini indirir).
 install_yenisite
 
+# ---------- site kaydı (yenisite --list / --uninstall için) ----------
+install -d -m 700 -o root -g root "$CONF_DIR" "$SITES_DIR"
+install -m 600 -o root -g root /dev/null "$SITES_DIR/$NAME.env"
+printf 'NAME=%q\nDOMAIN=%q\nPORT=%q\nCF_ZONE_ID=%q\nCF_ZONE_CREATED=%q\nCF_RECORD_IDS=%q\nGH_KEY_ID=%q\nCREATED=%q\n' \
+  "$NAME" "$DOMAIN" "$PORT" "${ZONE_ID:-}" "$([ -n "$NEW_ZONE" ] && echo 1 || echo 0)" "$CF_RECORD_IDS" "$GH_KEY_ID" "$(date +%F)" > "$SITES_DIR/$NAME.env"
+
 # ---------- bitti ----------
 echo
 bold "Kurulum tamamlandı ($VERSION)"
@@ -480,8 +708,17 @@ echo "     (kurulum ekranı bunu ister; sunucuda $ENV dosyasında da yazar)"
 echo "  3) Mağaza adını, logoyu ve yönetici hesabını gir."
 echo
 echo "  Yönetim paneli:     https://$DOMAIN$ADMIN_PATH"
+if [ -n "$NAMESERVERS" ]; then
+  echo
+  bold "  ÖNEMLİ — nameserver'ları değiştir:"
+  echo "  $ZONE_NAME alan adını aldığın firmanın panelinde (GoDaddy, Namecheap, Natro, isimtescil…)"
+  echo "  'Nameserver / DNS sunucuları' bölümünü 'özel' yapıp şunları yaz:"
+  for ns in $NAMESERVERS; do echo "      $ns"; done
+  echo "  Değişiklik birkaç dakika ile birkaç saat sürer. Durumu görmek için: yenisite --list"
+  echo "  Aktif olunca https://$DOMAIN/setup kendiliğinden açılır (HTTPS'i Caddy kendisi alır)."
+fi
 echo "  Servis günlüğü:     journalctl -u $NAME -f"
-if [ -n "$PUBLIC_IP" ] && [ "$DOMAIN_IP" != "$PUBLIC_IP" ]; then
+if [ -z "$ZONE" ] && [ -n "$PUBLIC_IP" ] && [ "$DOMAIN_IP" != "$PUBLIC_IP" ]; then
   echo
   warn "DNS henüz bu sunucuyu göstermiyor: A kaydını $PUBLIC_IP yap; HTTPS birkaç dakika içinde kendiliğinden gelir."
 fi
