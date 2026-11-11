@@ -13,6 +13,10 @@
 # Alan adını değiştirmek için: --alanadi <ad>  (yeni alan adı sorulur; Cloudflare'e eklenir, nameserver'lar söylenir)
 # Kaldırmak için: --uninstall <ad>   (önce /root'a son yedek alınır, adı yazarak onay istenir)
 set -euo pipefail
+# Yeni sunucularda ilk açılış güncellemesi apt'yi kilitleyebilir: kilit kalkana kadar bekle (en fazla 10 dk).
+# needrestart (Ubuntu) servisleri sormadan yeniden başlatsın.
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
+APT_LOCK=(-o DPkg::Lock::Timeout=600)
 
 GITHUB_REPO=starynightthomas/go-lob
 REPO=git@github.com:$GITHUB_REPO.git
@@ -98,8 +102,81 @@ gh_api() { # METHOD PATH [JSON]
 check_cf_token() { cf_api GET '/zones?per_page=50' 2> /dev/null | jq -e '.success' > /dev/null 2>&1; }
 check_gh_token() { gh_api GET "/repos/$GITHUB_REPO/keys" > /dev/null 2>&1; }
 
+# ---------- sunucuyu hazırlama (sunucu kurulumunun ilk adımı) ----------
+# Sistemi tamamen günceller, eksik araçları kurar, otomatik güvenlik güncellemelerini, gerekirse swap'i,
+# güvenlik duvarını (SSH portu açık kalır) ve fail2ban'ı açar. SSH giriş ayarlarına dokunmaz.
+ssh_ports() { sshd -T 2> /dev/null | awk '$1 == "port" {print $2}' | sort -u | tr '\n' ' '; }
+prepare_server() {
+  local ram_mb swap_mb ports
+  ram_mb=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo)
+  swap_mb=$(awk '/^SwapTotal:/{print int($2/1024)}' /proc/meminfo)
+  ports=$(ssh_ports); ports=${ports:-22 }
+  bold "Sunucu hazırlığı"
+  echo "  • Tüm sistem paketleri son sürüme yükseltilir (apt full-upgrade), gereksizler temizlenir"
+  echo "  • Araçlar: git, curl, jq, sqlite3, htop, unattended-upgrades, ufw, fail2ban"
+  echo "  • Otomatik güvenlik güncellemeleri ve saat eşitleme açılır"
+  if [ "$swap_mb" -lt 256 ] && [ "$ram_mb" -lt 4096 ]; then echo "  • RAM ${ram_mb} MB, swap yok → $(( ram_mb < 2048 ? ram_mb : 2048 )) MB swap dosyası oluşturulur"; fi
+  echo "  • Güvenlik duvarı (ufw): SSH (port ${ports% }), 80 ve 443 açık; diğerleri kapalı"
+  echo "  • fail2ban: SSH'ye art arda hatalı girişleri geçici olarak engeller"
+  echo "  SSH giriş ayarların (şifre / anahtar, root girişi) değiştirilmez."
+  echo
+  confirm "Sunucu hazırlansın mı?" || { warn "Hazırlık atlandı; sadece gerekli paketler kurulacak."; return 0; }
+
+  step "Sistem güncelleniyor (birkaç dakika sürebilir)"
+  export DEBIAN_FRONTEND=noninteractive
+  local apt_opts=(-y -qq "${APT_LOCK[@]}" -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+  apt-get "${APT_LOCK[@]}" update -qq
+  apt-get "${apt_opts[@]}" full-upgrade > /dev/null
+  apt-get "${apt_opts[@]}" install git curl ca-certificates gnupg jq sqlite3 xz-utils openssl htop \
+    unattended-upgrades ufw fail2ban > /dev/null
+  apt-get -y -qq "${APT_LOCK[@]}" autoremove --purge > /dev/null
+  ok "Sistem güncel"
+
+  step "Otomatik güvenlik güncellemeleri ve saat"
+  printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\nAPT::Periodic::AutocleanInterval "7";\n' > /etc/apt/apt.conf.d/20auto-upgrades
+  systemctl enable -q --now unattended-upgrades 2> /dev/null || true
+  timedatectl set-ntp true 2> /dev/null || true
+  ok "Güvenlik güncellemeleri her gün otomatik kurulur; saat eşitleniyor ($(timedatectl show -p Timezone --value 2> /dev/null || echo UTC))"
+
+  if [ "$swap_mb" -lt 256 ] && [ "$ram_mb" -lt 4096 ] && [ ! -e /swapfile ]; then
+    step "Swap"
+    local size=$(( ram_mb < 2048 ? ram_mb : 2048 ))
+    fallocate -l "${size}M" /swapfile 2> /dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$size" status=none
+    chmod 600 /swapfile
+    mkswap /swapfile > /dev/null
+    swapon /swapfile
+    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    ok "${size} MB swap açık"
+  fi
+
+  step "Güvenlik duvarı ve fail2ban"
+  local p
+  for p in $ports; do ufw allow "$p/tcp" > /dev/null; done
+  ufw allow 80/tcp > /dev/null
+  ufw allow 443 > /dev/null
+  ufw --force enable > /dev/null
+  systemctl enable -q --now fail2ban 2> /dev/null || true
+  ok "ufw açık (SSH ${ports% }, 80, 443); fail2ban çalışıyor"
+}
+
+# Çekirdek ya da temel kütüphaneler güncellendiyse yeniden başlatmayı önerir.
+offer_reboot() {
+  [ -f /var/run/reboot-required ] || return 0
+  echo
+  warn "Güncellemelerin tamamlanması için sunucunun yeniden başlatılması gerekiyor."
+  if [ "$YES" != 1 ] && confirm "Şimdi yeniden başlatılsın mı? (bağlantın kopar, 1 dakika sonra tekrar bağlanabilirsin)"; then
+    echo "Yeniden başlatılıyor…"
+    systemctl reboot
+  else
+    echo "  Uygun bir zamanda yeniden başlat: sudo reboot   (siteler açılışta kendiliğinden başlar)"
+  fi
+}
+
 server_setup() {
   bold "Sunucu kurulumu (bir kez)"
+  echo
+  prepare_server
+  echo
   echo "Siteleri tamamen otomatik kurabilmem için iki anahtar gerekiyor. Yazdıkların ekranda görünmez;"
   echo "sadece bu sunucuda, root'un okuyabileceği $CRED dosyasında saklanır."
   echo
@@ -335,8 +412,8 @@ ensure_pkgs() {
   local need=() p
   for p in "$@"; do dpkg -s "$p" > /dev/null 2>&1 || need+=("$p"); done
   [ ${#need[@]} -eq 0 ] && return 0
-  apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${need[@]}" > /dev/null
+  apt-get "${APT_LOCK[@]}" update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK[@]}" install -y -qq "${need[@]}" > /dev/null
 }
 ensure_pkgs curl ca-certificates jq
 load_creds
@@ -516,7 +593,7 @@ if [ "$SETUP" = 1 ] || [ ! -f "$CRED" ]; then
   [ "$YES" = 1 ] && [ ! -f "$CRED" ] && die "Önce sunucu kurulumu gerekli: script'i --setup ile, terminalde çalıştır."
   server_setup
   echo
-  confirm "Şimdi ilk siteyi kuralım mı?" || { echo "Site kurmak için istediğin zaman: yenisite"; exit 0; }
+  confirm "Şimdi ilk siteyi kuralım mı?" || { echo "Site kurmak için istediğin zaman: yenisite"; offer_reboot; exit 0; }
   echo
 fi
 
@@ -595,8 +672,8 @@ step "Gerekli paketler"
 NEED=()
 for p in git curl ca-certificates sqlite3 xz-utils openssl jq; do dpkg -s "$p" > /dev/null 2>&1 || NEED+=("$p"); done
 if [ ${#NEED[@]} -gt 0 ]; then
-  apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${NEED[@]}" > /dev/null
+  apt-get "${APT_LOCK[@]}" update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK[@]}" install -y -qq "${NEED[@]}" > /dev/null
 fi
 ok "Gerekli paketler hazır (sadece eksikler kuruldu; sistem paketleri güncellenmedi)"
 
@@ -669,7 +746,7 @@ as_app git -C "$APP" checkout -q --force "refs/tags/$VERSION"
 NPM_CI="cd '$APP' && npm ci --omit=dev --no-audit --no-fund --no-update-notifier --loglevel=error"
 if ! as_app sh -c "$NPM_CI"; then
   warn "Hazır paketler bu sunucuya uymadı; derleme araçları kurulup tekrar deneniyor"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential python3 > /dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK[@]}" install -y -qq build-essential python3 > /dev/null
   as_app sh -c "$NPM_CI"
 fi
 ok "$VERSION kuruldu"
@@ -738,11 +815,11 @@ step "Web sunucusu ve HTTPS"
 dns_wait_or_warn
 case "$WEB" in
   none)
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https gnupg > /dev/null
+    DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK[@]}" install -y -qq debian-keyring debian-archive-keyring apt-transport-https gnupg > /dev/null
     curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
     curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq caddy > /dev/null
+    apt-get "${APT_LOCK[@]}" update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK[@]}" install -y -qq caddy > /dev/null
     install -d /etc/caddy/sites
     backup_file /etc/caddy/Caddyfile
     printf '# Her mağaza kendi dosyasında: /etc/caddy/sites/*.caddy\nimport sites/*.caddy\n' > /etc/caddy/Caddyfile
@@ -764,7 +841,7 @@ case "$WEB" in
     systemctl reload caddy
     ;;
   nginx)
-    { dpkg -s certbot && dpkg -s python3-certbot-nginx; } > /dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot python3-certbot-nginx > /dev/null
+    { dpkg -s certbot && dpkg -s python3-certbot-nginx; } > /dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK[@]}" install -y -qq certbot python3-certbot-nginx > /dev/null
     SITE=$(nginx_site_path)
     write_nginx_site
     if [ -d /etc/nginx/sites-enabled ]; then ln -sf "$SITE" "/etc/nginx/sites-enabled/$NAME"; fi
@@ -776,7 +853,7 @@ case "$WEB" in
     certbot_for nginx
     ;;
   apache)
-    { dpkg -s certbot && dpkg -s python3-certbot-apache; } > /dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot python3-certbot-apache > /dev/null
+    { dpkg -s certbot && dpkg -s python3-certbot-apache; } > /dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get "${APT_LOCK[@]}" install -y -qq certbot python3-certbot-apache > /dev/null
     a2enmod -q proxy proxy_http headers > /dev/null
     SITE=/etc/apache2/sites-available/$NAME.conf
     write_apache_site
@@ -852,3 +929,4 @@ if [ -z "$ZONE" ] && [ -n "$PUBLIC_IP" ] && [ "$DOMAIN_IP" != "$PUBLIC_IP" ]; th
   echo
   warn "DNS henüz bu sunucuyu göstermiyor: A kaydını $PUBLIC_IP yap; HTTPS birkaç dakika içinde kendiliğinden gelir."
 fi
+offer_reboot
