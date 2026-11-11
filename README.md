@@ -37,6 +37,8 @@ Alan adını ve kurulum adını sorar, sonra hepsini kendisi yapar:
 
 ```bash
 yenisite --list              # bu sunucudaki siteler ve Cloudflare durumu
+yenisite --alanadi <ad>      # sitenin alan adını değiştirir: yeni alan adı Cloudflare'e eklenir, DNS ve HTTPS ayarlanır,
+                             # nameserver'lar söylenir; eski adres istersen yeni adrese yönlenir
 yenisite --uninstall <ad>    # siteyi kaldırır (önce /root'a son yedek; DNS kayıtları ve GitHub anahtarı da silinir)
 yenisite --dry-run           # sadece planı gösterir
 ```
